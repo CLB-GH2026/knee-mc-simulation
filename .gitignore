@@ -11,6 +11,11 @@
 .venv/Scripts/results_*/
 .venv/Scripts/*.npy
 .venv/Scripts/*.html
+.venv/Scripts/activate
+.venv/Scripts/activate.*
+.venv/Scripts/activate_this.py
+.venv/Scripts/deactivate.bat
+.venv/Scripts/desktop.ini
 
 
 # IDE
