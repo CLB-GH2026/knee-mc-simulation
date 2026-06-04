@@ -1,0 +1,19 @@
+# Python venv — ignore everything except Scripts content we want
+.venv/*
+!.venv/Scripts/
+
+# Ignore venv internals inside Scripts
+.venv/Scripts/*.pyd
+.venv/Scripts/*.dll
+.venv/Scripts/*.exe
+.venv/Scripts/__pycache__/
+.venv/Scripts/vba_extract.py
+.venv/Scripts/results_*/
+.venv/Scripts/*.npy
+.venv/Scripts/*.html
+
+
+# IDE
+.idea/
+__pycache__/
+*.pyc
