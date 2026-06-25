@@ -254,6 +254,7 @@ def run_subject(subject_id, mesh_dir_base, output_dir, melanin_condition='fair')
             tissues, origin, VOXEL_SIZE,
             pmcx_source_plus=pmcx_source_plus,
             mesh_center=mesh_center,
+            melanin_condition=melanin_condition,
         )
         overlay_html = str(subj_dir / f"fluence_overlay_{subject_id}_{melanin_condition}.html")
         write_interactive_html(
@@ -1025,9 +1026,18 @@ TISSUE_COLORS = {
     10: "rgba(0,0,255,1.00)",       # pat-cart
     11: "rgba(180,60,60,0.4)",     # muscle
     12: "rgba(255,220,150,0.4)",   # adipose
-    13: "rgba(210,180,140,0.30)",   # skin
+    13: "rgba(210,180,140,0.30)",   # skin        — overridden per melanin condition
     14: "rgba(173,216,230,0.5)",   # synovial
-    15: "rgba(255,228,196,0.15)",  # epidermis
+    15: "rgba(255,228,196,0.15)",  # epidermis   — overridden per melanin condition
+}
+
+# Skin and epidermis colors keyed by melanin condition (Fitzpatrick scale).
+# Dermis (label 13) opacity 0.30, epidermis (label 15) opacity 0.15 — unchanged.
+SKIN_TONE_COLORS = {
+    #           label-13 (skin/dermis)          label-15 (epidermis)
+    'fair':  {13: "rgba(255,213,170,0.30)",  15: "rgba(255,220,185,0.15)"},  # Fitzpatrick I-II
+    'olive': {13: "rgba(185,130,85,0.30)",   15: "rgba(198,143,95,0.15)"},   # Fitzpatrick III-IV
+    'dark':  {13: "rgba(101,60,28,0.30)",    15: "rgba(115,72,35,0.15)"},    # Fitzpatrick V-VI
 }
 
 
@@ -1095,8 +1105,11 @@ def add_source_traces(fig, origin, mesh_center, pmcx_source_plus, arrow_length=2
 
 def plot_results(vol, fluence_combined, fluence_list, all_fluences, fluence_names,
                  tissues, origin, spacing, pmcx_source_plus, smooth_sigma=1.0,
-                 plot_stride=3, mesh_center=None):     # plot_stride sets the downsampling
+                 plot_stride=3, mesh_center=None, melanin_condition='fair'):
     """Build Plotly figure with tissue isosurfaces and fluence overlay."""
+
+    # Merge base colors with condition-specific skin/epidermis overrides
+    tissue_colors = {**TISSUE_COLORS, **SKIN_TONE_COLORS.get(melanin_condition, {})}
 
     s         = plot_stride
     vol_p     = vol[::s, ::s, ::s]
@@ -1164,7 +1177,7 @@ def plot_results(vol, fluence_combined, fluence_list, all_fluences, fluence_name
     sorted_tissues = sorted(tissues.items(), key=lambda kv: kv[1][1])
     for name, (path, label, _) in sorted_tissues:
         label_mask   = gaussian_filter((vol_p == label).astype(float), sigma=0.8)
-        color        = TISSUE_COLORS.get(label, "rgba(200,200,200,0.80)")
+        color        = tissue_colors.get(label, "rgba(200,200,200,0.80)")
         smoothed_max = label_mask.max()
 
         if smoothed_max < 0.01:
