@@ -1928,7 +1928,7 @@ if __name__ == "__main__":
 
     all_condition_results = {}   # {condition: [(subj_id, results), ...]}
 
-    for condition in ['fair']:  # TEMP: full run uses MELANIN_CONDITIONS
+    for condition in MELANIN_CONDITIONS:
         print(f"\n{'=' * 60}")
         print(f"  Melanin condition: {condition.upper()}")
         print(f"{'=' * 60}")
