@@ -22,6 +22,7 @@ from scipy.ndimage import gaussian_filter, binary_dilation, binary_erosion, dist
 from pathlib import Path
 import webbrowser
 import os
+import subprocess
 from datetime import datetime
 
 base_dir = Path()
@@ -238,6 +239,27 @@ def run_subject(subject_id, mesh_dir_base, output_dir, melanin_condition='fair')
         np.save(subj_dir / "fluence_combined.npy", fluence_combined)
         for i, flu in enumerate(fluence_list):
             np.save(subj_dir / f"fluence_src{i + 1}.npy", flu)
+
+        # ── Step 7b: 3D fluence overlay HTML ──────────────────────────────
+        all_fluences   = [fluence_combined] + fluence_list
+        fluence_names_local = ['Combined'] + [f'Source {i+1}' for i in range(len(fluence_list))]
+
+        fig = plot_results(
+            vol, fluence_combined, fluence_list,
+            all_fluences, fluence_names_local,
+            tissues, origin, VOXEL_SIZE,
+            pmcx_source_plus=pmcx_source_plus,
+            mesh_center=mesh_center,
+        )
+        overlay_html = str(subj_dir / f"fluence_overlay_{subject_id}_{melanin_condition}.html")
+        write_interactive_html(
+            fig, tissues, all_fluences, fluence_names_local,
+            pmcx_source_plus,
+            output_path=overlay_html,
+        )
+        print(f"  Saved: {overlay_html}")
+        if AUTO_OPEN_HTML:
+            webbrowser.open(f"file:///{Path(overlay_html).resolve().as_posix()}")
 
         return subject_id, results
 
@@ -505,8 +527,10 @@ GRID_DIMS_MM = (150, 140, 285)   # x, y, z in mm — edit these, not VOXEL_RES
 # Compute VOXEL_RES automatically from physical size and voxel size
 VOXEL_RES = tuple(int(round(d / VOXEL_SIZE)) for d in GRID_DIMS_MM)
 
-FLUENCE_OUTPUT = None          # None to run pmcx, or True to load saved files
-AUTO_ORIENT    = True          # auto-detect and correct Z-axis inversion (OKS002-type)
+FLUENCE_OUTPUT  = None   # None to run pmcx, or True to load saved files
+AUTO_ORIENT     = True   # auto-detect and correct Z-axis inversion (OKS002-type)
+AUTO_OPEN_HTML  = True   # open each fluence overlay in the browser as it is written
+                          # set False for unattended full-batch runs
 
 # Soft-tissue wrapping layer thicknesses (mm).
 # Anterior knee: patella is subcutaneous, so muscle is absent — 6-8 mm is more
@@ -1031,9 +1055,9 @@ def voxel_to_centered_world(vox_pos, origin, spacing, mesh_center):
 # 10. SOURCE MARKER TRACES
 # ─────────────────────────────────────────────────────────────────────────────
 
-def add_source_traces(fig, origin, mesh_center, arrow_length=20):
+def add_source_traces(fig, origin, mesh_center, pmcx_source_plus, arrow_length=20):
     """Add source position markers and direction arrows to figure."""
-    for src in PMCX_SOURCE_PLUS:
+    for src in pmcx_source_plus:
         pos       = voxel_to_centered_world(src['srcpos'], origin, VOXEL_SIZE, mesh_center)
         direction = np.array(src['srcdir'], dtype=float)
         direction /= np.linalg.norm(direction)
@@ -1066,7 +1090,7 @@ def add_source_traces(fig, origin, mesh_center, arrow_length=20):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def plot_results(vol, fluence_combined, fluence_list, all_fluences, fluence_names,
-                 tissues, origin, spacing, smooth_sigma=1.0,
+                 tissues, origin, spacing, pmcx_source_plus, smooth_sigma=1.0,
                  plot_stride=3, mesh_center=None):     # plot_stride sets the downsampling
     """Build Plotly figure with tissue isosurfaces and fluence overlay."""
 
@@ -1189,7 +1213,7 @@ def plot_results(vol, fluence_combined, fluence_list, all_fluences, fluence_name
         ))
 
     fig = go.Figure(data=traces)
-    fig = add_source_traces(fig, origin, mesh_center, arrow_length=20)
+    fig = add_source_traces(fig, origin, mesh_center, pmcx_source_plus, arrow_length=20)
     fig._n_tissue_traces = n_tissue_traces_added
 
     fig.update_layout(
@@ -1499,14 +1523,15 @@ def plot_depth_histogram(bin_centers, mean_flu, subject_id, bin_width_cm=0.25,
 # 14. WRITE INTERACTIVE HTML
 # ─────────────────────────────────────────────────────────────────────────────
 
-def write_interactive_html(fig, tissues, output_path="fluence_overlay.html"):
+def write_interactive_html(fig, tissues, all_fluences, fluence_names,
+                           pmcx_source_plus, output_path="fluence_overlay.html"):
     import json
     import re
 
     sorted_tissues = sorted(tissues.items(), key=lambda kv: kv[1][1])
     n_tissues      = fig._n_tissue_traces
     n_fluence      = len(all_fluences)
-    n_sources      = len(PMCX_SOURCE_PLUS) * 3
+    n_sources      = len(pmcx_source_plus) * 3
     n_total        = len(fig.data)
 
     assert n_tissues + n_fluence + n_sources == n_total, \
@@ -1851,14 +1876,43 @@ def melanin_comparison_to_csv(all_condition_results, output_path, wavelength_nm,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 14. MAIN
+# 14. GITHUB SYNC
+# ─────────────────────────────────────────────────────────────────────────────
+
+def ensure_repo_current():
+    """Pull latest scripts and LFS mesh files from GitHub before each run."""
+    # Repo root is three levels up from this script:
+    #   .venv/Scripts/<script>.py  →  .venv/Scripts/  →  .venv/  →  repo root
+    repo_root = Path(__file__).resolve().parent.parent.parent
+
+    def _run(cmd, label):
+        result = subprocess.run(cmd, cwd=str(repo_root),
+                                capture_output=True, text=True)
+        if result.returncode == 0:
+            print(f"  [GIT] {label}: OK")
+        else:
+            print(f"  [GIT] {label} warning: {result.stderr.strip() or result.stdout.strip()}")
+        return result.returncode == 0
+
+    print("\nSyncing with GitHub...")
+    _run(["git", "pull", "--rebase", "--autostash"], "pull --rebase")
+    _run(["git", "lfs", "pull"],                     "lfs pull")
+    print()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 15. MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
 
+    ensure_repo_current()
+
     start_time  = time.perf_counter()
     SUBJECT_IDS = [f"OKS{i:03d}" for i in range(1, 10) if i != 5]
-    BASE_DIR    = Path(".")
+    # BASE_DIR points to the Scripts folder alongside the STL subfolders,
+    # regardless of the working directory from which the script is launched.
+    BASE_DIR    = Path(__file__).resolve().parent
     RUN_ID      = datetime.now().strftime("%Y%m%d_%H%M%S")
     OUTPUT_DIR  = Path(f"results_650nm_{RUN_ID}")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -1870,7 +1924,7 @@ if __name__ == "__main__":
 
     all_condition_results = {}   # {condition: [(subj_id, results), ...]}
 
-    for condition in MELANIN_CONDITIONS:
+    for condition in ['fair']:  # TEMP: full run uses MELANIN_CONDITIONS
         print(f"\n{'=' * 60}")
         print(f"  Melanin condition: {condition.upper()}")
         print(f"{'=' * 60}")
