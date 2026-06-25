@@ -18,6 +18,10 @@
 .venv/Scripts/desktop.ini
 
 
+# Simulation results — large binaries excluded; CSVs committed individually
+*.npy
+results_*/**/*.html
+
 # IDE
 .idea/
 __pycache__/
