@@ -1716,6 +1716,10 @@ def write_interactive_html(fig, tissues, all_fluences, fluence_names,
         opt.textContent = name;
         sel.appendChild(opt);
     });
+    const offOpt = document.createElement('option');
+    offOpt.value = -1;
+    offOpt.textContent = 'All Off';
+    sel.appendChild(offOpt);
 
     function toggleTissue(i) {
         visState[i] = !visState[i];
@@ -1736,7 +1740,7 @@ def write_interactive_html(fig, tissues, all_fluences, fluence_names,
     function switchFluence(idx) {
         const active = parseInt(idx);
         for (let j = 0; j < nFluence; j++) {
-            visState[nTissues + j] = (j === active);
+            visState[nTissues + j] = (active >= 0) && (j === active);
         }
         applyVisibility();
     }
