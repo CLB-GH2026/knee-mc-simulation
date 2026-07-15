@@ -156,16 +156,34 @@ JOINT_FILES = {
 JOINT_ARTICULATION = {
     "shoulder": ("humerus_raw.stl", "scapula_raw.stl"),      # glenohumeral
     "elbow":    ("humerus_distal_raw.stl", "ulna_raw.stl"),  # humero-ulnar hinge
-    # lower_back has no single articulation pair — falls back to bone centroid.
+    # lower_back has no single articulation pair — see JOINT_RECENTER instead.
+}
+
+# For joints that aren't a two-bone articulation (the lumbar column), recentre
+# on the centroid of these target structures instead of the closest-points
+# midpoint. Centring on the discs keeps the PBM targets in the middle of the
+# grid; recentring on the whole column would be dragged inferior by the large
+# sacrum, pushing the discs high in the grid.
+JOINT_RECENTER = {
+    "lower_back": ["L3L4_disc_raw.stl", "L4L5_disc_raw.stl", "L5S1_disc_raw.stl"],
 }
 
 # After recentring, bones are cropped to a sphere of this radius about the joint
-# origin. BodyParts3D provides full-length bones (~300 mm); left uncropped, the
-# long shaft biases the bounding-box midpoint that the pipeline uses to centre
-# the grid, pushing the joint to the grid edge. Cropping keeps the joint region
-# of every bone and centres the grid on it — the same effect the knee's
-# pre-cropped OKS meshes have. 90 mm comfortably covers every joint's grid.
-JOINT_CROP_RADIUS_MM = 90.0
+# origin. BodyParts3D provides full-length bones (~300 mm); for a compact joint,
+# the long shaft would otherwise bias the bounding-box midpoint that the pipeline
+# uses to centre the grid, pushing the joint to the grid edge. Cropping keeps the
+# joint region of every bone and centres the grid on it — the same effect the
+# knee's pre-cropped OKS meshes have.
+#   • shoulder/elbow: 90 mm sphere comfortably covers their grids.
+#   • lower_back: 100 mm about the disc centroid — keeps the full L3–S1 span
+#     (~150 mm) while capping the lower sacrum, which extends ~145 mm below the
+#     discs (outside the PBM zone) and would otherwise drag the bounding-box
+#     midpoint — and thus the grid centre — well inferior to the disc targets.
+JOINT_CROP_RADIUS_MM = {
+    "shoulder":   90.0,
+    "elbow":      90.0,
+    "lower_back": 100.0,
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SOFT-TISSUE SYNTHESIS
@@ -300,9 +318,14 @@ def orient_and_recenter_joint(joint, out_dir, file_map):
         m.apply_transform(_BP3D_TO_PIPELINE)
         meshes[n] = m
 
-    # Articulation centre, computed in the already-rotated frame.
+    # Recentring origin, computed in the already-rotated frame.
     pair = JOINT_ARTICULATION.get(joint)
-    if pair and all(p in meshes for p in pair):
+    recenter_files = JOINT_RECENTER.get(joint)
+    if recenter_files and all(f in meshes for f in recenter_files):
+        verts = np.vstack([meshes[f].vertices for f in recenter_files])
+        center = (verts.min(axis=0) + verts.max(axis=0)) / 2.0
+        basis = "centroid of target structures (" + ", ".join(recenter_files) + ")"
+    elif pair and all(p in meshes for p in pair):
         center = _articulation_center(meshes[pair[0]], meshes[pair[1]])
         basis = f"articulation of {pair[0]} ↔ {pair[1]}"
     else:
@@ -311,12 +334,18 @@ def orient_and_recenter_joint(joint, out_dir, file_map):
         center = (verts.min(axis=0) + verts.max(axis=0)) / 2.0
         basis = "combined bone bounding-box centre"
 
+    crop_r = JOINT_CROP_RADIUS_MM.get(joint) if isinstance(JOINT_CROP_RADIUS_MM, dict) \
+        else JOINT_CROP_RADIUS_MM
     print(f"    Reframe to pipeline axes (−X, −Y, +Z) + recentre ({basis})")
     print(f"      articulation origin shifted by {(-center).round(1)} mm")
-    print(f"      cropping bones to {JOINT_CROP_RADIUS_MM:.0f} mm sphere about the joint")
+    if crop_r:
+        print(f"      cropping bones to {crop_r:.0f} mm sphere about the joint")
+    else:
+        print(f"      no crop (column fits the grid)")
     for n, m in meshes.items():
         m.apply_translation(-center)
-        m = _voxel_crop_sphere(m, JOINT_CROP_RADIUS_MM)
+        if crop_r:
+            m = _voxel_crop_sphere(m, crop_r)
         m.export(str(out_dir / n))
     return center
 
