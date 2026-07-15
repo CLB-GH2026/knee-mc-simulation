@@ -34,7 +34,9 @@ python extract_bodyparts3d.py --bp3d_dir ./BodyParts3D --joint elbow --side left
 
 DEPENDENCIES
 ------------
-pip install trimesh numpy scipy
+pip install trimesh numpy scipy scikit-image
+  (scikit-image + scipy.ndimage drive the voxel-based bone cropping and the
+   cartilage/labrum synthesis that fills the joints' soft-tissue targets.)
 
 NOTES
 -----
@@ -67,6 +69,7 @@ from pathlib import Path
 
 import numpy as np
 import trimesh
+from scipy import ndimage
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MASTER MAPPING
@@ -154,6 +157,51 @@ JOINT_ARTICULATION = {
     "shoulder": ("humerus_raw.stl", "scapula_raw.stl"),      # glenohumeral
     "elbow":    ("humerus_distal_raw.stl", "ulna_raw.stl"),  # humero-ulnar hinge
     # lower_back has no single articulation pair — falls back to bone centroid.
+}
+
+# After recentring, bones are cropped to a sphere of this radius about the joint
+# origin. BodyParts3D provides full-length bones (~300 mm); left uncropped, the
+# long shaft biases the bounding-box midpoint that the pipeline uses to centre
+# the grid, pushing the joint to the grid edge. Cropping keeps the joint region
+# of every bone and centres the grid on it — the same effect the knee's
+# pre-cropped OKS meshes have. 90 mm comfortably covers every joint's grid.
+JOINT_CROP_RADIUS_MM = 90.0
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SOFT-TISSUE SYNTHESIS
+# BodyParts3D has no articular cartilage, labrum, or joint ligaments (it only
+# segments costal/nasal/thyroid cartilage). Rather than leave placeholder cubes,
+# we synthesise these targets from the bone geometry we do have:
+#   • "shell": a thin cartilage layer, offset outward from the joint-facing bone
+#     surface (voxel dilation minus bone), optionally split lateral/medial.
+#   • "ring": a fibrocartilage torus (glenoid labrum, annular ligament).
+# These are modelling approximations for MC fluence *targets*, not measured
+# geometry — replace with segmented MRI if/when available. Radii/thicknesses are
+# in mm; x_side "lat"/"med" splits a distal-humerus shell (right side: +X = lat).
+# ─────────────────────────────────────────────────────────────────────────────
+SOFT_TISSUE_SYNTHESIS = {
+    "shoulder": {
+        "humeral_cartilage_raw.stl": {"kind": "shell", "bone": "humerus_raw.stl",
+                                       "thickness": 1.5, "radius": 26},
+        "glenoid_cartilage_raw.stl": {"kind": "shell", "bone": "scapula_raw.stl",
+                                       "thickness": 1.5, "radius": 15},
+        "labrum_raw.stl":            {"kind": "ring", "bone": "scapula_raw.stl",
+                                       "major": 13.0, "minor": 2.5, "center": "origin",
+                                       "axis": "toward_head", "head_bone": "humerus_raw.stl",
+                                       "head_radius": 28},
+    },
+    "elbow": {
+        "capitellum_cartilage_raw.stl":  {"kind": "shell", "bone": "humerus_distal_raw.stl",
+                                          "thickness": 1.3, "radius": 16, "x_side": "lat"},
+        "trochlear_cartilage_raw.stl":   {"kind": "shell", "bone": "humerus_distal_raw.stl",
+                                          "thickness": 1.3, "radius": 16, "x_side": "med"},
+        "radial_head_cartilage_raw.stl": {"kind": "shell", "bone": "radius_raw.stl",
+                                          "thickness": 1.2, "radius": 12, "center": "head",
+                                          "head_radius": 15},
+        "annular_lig_raw.stl":           {"kind": "ring", "bone": "radius_raw.stl",
+                                          "major": 11.0, "minor": 2.0, "center": "head",
+                                          "head_radius": 15, "axis": "long"},
+    },
 }
 
 DBCLS_ZIP_URL = (
@@ -265,10 +313,148 @@ def orient_and_recenter_joint(joint, out_dir, file_map):
 
     print(f"    Reframe to pipeline axes (−X, −Y, +Z) + recentre ({basis})")
     print(f"      articulation origin shifted by {(-center).round(1)} mm")
+    print(f"      cropping bones to {JOINT_CROP_RADIUS_MM:.0f} mm sphere about the joint")
     for n, m in meshes.items():
         m.apply_translation(-center)
+        m = _voxel_crop_sphere(m, JOINT_CROP_RADIUS_MM)
         m.export(str(out_dir / n))
     return center
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VOXEL-BASED GEOMETRY HELPERS (bone cropping + soft-tissue synthesis)
+# All routes go through a filled voxel grid + marching cubes, so they need
+# scikit-image (imported lazily by trimesh's marching_cubes) and scipy.ndimage.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _voxelgrid_to_mesh(matrix, transform):
+    """Marching-cubes a boolean voxel matrix back to a world-space Trimesh."""
+    mesh = trimesh.voxel.VoxelGrid(matrix, transform=transform).marching_cubes
+    mesh.apply_transform(transform)   # marching_cubes returns index space
+    return mesh
+
+
+def _voxel_crop_sphere(mesh, radius_mm, pitch=1.0, center=(0, 0, 0)):
+    """Crop a mesh to a sphere about `center` via the voxel route (watertight,
+    no polygon-triangulation engine needed)."""
+    vg = mesh.voxelized(pitch=pitch).fill()
+    mat = vg.matrix.copy()
+    T = vg.transform
+    idx = np.argwhere(mat)
+    world = (T[:3, :3] @ idx.T).T + T[:3, 3]
+    far = np.linalg.norm(world - np.asarray(center, float), axis=1) >= radius_mm
+    f = idx[far]
+    mat[f[:, 0], f[:, 1], f[:, 2]] = False
+    return _voxelgrid_to_mesh(mat, T)
+
+
+def _cartilage_shell(bone_mesh, thickness_mm, region_radius_mm,
+                     center=(0, 0, 0), x_side=None, pitch=1.0):
+    """Thin cartilage shell offset outward from the joint-facing bone surface,
+    restricted to a sphere about `center` (and optionally one side in X)."""
+    vg = bone_mesh.voxelized(pitch=pitch).fill()
+    bone = vg.matrix
+    T = vg.transform
+    r = max(1, int(round(thickness_mm / pitch)))
+    shell = ndimage.binary_dilation(bone, iterations=r) & ~bone
+    idx = np.argwhere(shell)
+    world = (T[:3, :3] @ idx.T).T + T[:3, 3]
+    c = np.asarray(center, float)
+    keep = np.linalg.norm(world - c, axis=1) < region_radius_mm
+    if x_side == "lat":
+        keep &= world[:, 0] > c[0]
+    elif x_side == "med":
+        keep &= world[:, 0] < c[0]
+    sel = idx[keep]
+    mat = np.zeros_like(shell)
+    mat[sel[:, 0], sel[:, 1], sel[:, 2]] = True
+    return _voxelgrid_to_mesh(mat, T)
+
+
+def _rot_z_to(v):
+    """4x4 rotation mapping +Z onto unit vector v."""
+    v = np.asarray(v, float)
+    v = v / np.linalg.norm(v)
+    z = np.array([0.0, 0.0, 1.0])
+    axis = np.cross(z, v)
+    s = np.linalg.norm(axis)
+    if s < 1e-9:
+        return (np.eye(4) if v[2] > 0
+                else trimesh.transformations.rotation_matrix(np.pi, [1, 0, 0]))
+    axis /= s
+    ang = np.arccos(np.clip(np.dot(z, v), -1.0, 1.0))
+    return trimesh.transformations.rotation_matrix(ang, axis)
+
+
+def _ring(axis_vec, center, major_radius, minor_radius):
+    """Fibrocartilage torus with its axis along `axis_vec`, centred at `center`."""
+    t = trimesh.creation.torus(major_radius, minor_radius)
+    t.apply_transform(_rot_z_to(axis_vec))
+    t.apply_translation(np.asarray(center, float))
+    return t
+
+
+def _head_center(bone_mesh, region_radius_mm, center=(0, 0, 0), min_pts=200):
+    """Centroid of a bone's articular head — vertices near `center`, with a
+    nearest-N fallback when the head is offset from the joint origin (e.g. the
+    radial head relative to the humero-ulnar articulation)."""
+    c = np.asarray(center, float)
+    v = bone_mesh.vertices
+    d = np.linalg.norm(v - c, axis=1)
+    near = v[d < region_radius_mm]
+    if len(near) < min_pts:
+        near = v[np.argsort(d)[:min_pts]]
+    return near.mean(axis=0)
+
+
+def _long_axis(bone_mesh):
+    """First principal axis (long direction) of a bone."""
+    v = bone_mesh.vertices - bone_mesh.vertices.mean(axis=0)
+    _, _, Vt = np.linalg.svd(v, full_matrices=False)
+    return Vt[0]
+
+
+def synthesize_soft_tissue(joint, out_dir):
+    """Replace soft-tissue placeholder cubes with cartilage shells / rings
+    synthesised from the joint's (already reframed, recentred, cropped) bones."""
+    specs = SOFT_TISSUE_SYNTHESIS.get(joint)
+    if not specs:
+        return []
+    out_dir = Path(out_dir)
+    bones = {}
+    synthesised = []
+
+    def bone(name):
+        if name not in bones:
+            bones[name] = load_mesh(out_dir / name)
+        return bones[name]
+
+    for out_name, spec in specs.items():
+        try:
+            b = bone(spec["bone"])
+            if spec.get("center") == "head":
+                ctr = _head_center(b, spec.get("head_radius", 15))
+            else:
+                ctr = np.zeros(3)
+            if spec["kind"] == "shell":
+                mesh = _cartilage_shell(b, spec["thickness"], spec["radius"],
+                                        center=ctr, x_side=spec.get("x_side"))
+            elif spec["kind"] == "ring":
+                if spec.get("axis") == "toward_head":
+                    axis = _head_center(bone(spec["head_bone"]), spec["head_radius"])
+                else:  # "long"
+                    axis = _long_axis(b)
+                mesh = _ring(axis, ctr, spec["major"], spec["minor"])
+            else:
+                continue
+            mesh.export(str(out_dir / out_name))
+            synthesised.append(out_name)
+            tag = "watertight" if mesh.is_watertight else "NOT watertight"
+            print(f"    Synthesised {out_name}  ({len(mesh.faces):,} faces, "
+                  f"{mesh.volume:.0f} mm³)  [{tag}]")
+        except Exception as e:
+            print(f"    ⚠  Could not synthesise {out_name} ({e}) — placeholder kept")
+    return synthesised
 
 
 def fma_to_stl_path(bp3d_dir, fma_id):
@@ -402,18 +588,31 @@ def process_joint(joint, side, bp3d_dir, out_dir, dbcls_zip_path, tmp_dir):
             print(f"    ❌  Error processing {stl_name}: {e}")
             results["failed"].append(stl_name)
 
-    # Reframe bones to pipeline axes and recentre on the articulation so the
-    # meshes sit inside the simulation grid alongside the placeholder cubes.
+    # Reframe bones to pipeline axes, recentre on the articulation, and crop to
+    # the joint region so the meshes sit centred inside the simulation grid.
     if results["ok"]:
         try:
             orient_and_recenter_joint(joint, out_dir, file_map)
         except Exception as e:
             print(f"  ⚠  Joint reframing skipped ({e}) — meshes left in world coords")
+        # Synthesise cartilage / labrum / ligament targets from the bones,
+        # replacing the soft-tissue placeholder cubes where configured.
+        try:
+            made = synthesize_soft_tissue(joint, out_dir)
+            # Reclassify synthesised files out of the placeholder bucket.
+            results["synthesized"] = [n for n in results["placeholder"] if n in made]
+            results["placeholder"] = [n for n in results["placeholder"] if n not in made]
+        except Exception as e:
+            print(f"  ⚠  Soft-tissue synthesis skipped ({e}) — placeholders kept")
 
     # Summary
     print(f"\n  ── Summary for {joint} ──────────────────────────────────")
-    print(f"  ✅  Extracted:    {len(results['ok'])} files")
-    print(f"  ⚠   Placeholder: {len(results['placeholder'])} files (cartilage/soft tissue)")
+    print(f"  ✅  Extracted:    {len(results['ok'])} bone files")
+    if results.get("synthesized"):
+        print(f"  🧩  Synthesised:  {len(results['synthesized'])} soft-tissue targets "
+              f"(cartilage/labrum/ligament from bone geometry)")
+    if results["placeholder"]:
+        print(f"  ⚠   Placeholder: {len(results['placeholder'])} files (cube — no geometry source)")
     if results["failed"]:
         print(f"  ❌  Failed:      {len(results['failed'])} files: {results['failed']}")
     return results
@@ -589,10 +788,12 @@ def main():
     print("       python \"ELB Models_MC Results_808nm.py\"   # elbow")
     print("       python \"LBK Models_MC Results_808nm.py\"   # lower back")
     print()
-    print("  4. Placeholder STLs (cartilage, labrum, annular ligament, discs)")
-    print("     are tiny 4x4x4 mm cubes. The pipeline wraps soft tissue")
-    print("     synthetically, so simulations run without them. Replace with")
-    print("     real segmentations (3D Slicer / SPIDER dataset) for accuracy.")
+    print("  4. Shoulder/elbow cartilage, labrum, and the annular ligament are")
+    print("     SYNTHESISED from the bone surfaces (offset shells + rings), since")
+    print("     BodyParts3D has no articular soft tissue. They are modelling")
+    print("     approximations for MC fluence targets — replace with segmented")
+    print("     MRI (shoulder/elbow atlas) for measured accuracy. Any remaining")
+    print("     placeholder cubes (e.g. lower-back discs) have no geometry source.")
     print()
     print("  Attribution: BodyParts3D, (c) DBCLS, CC-BY-SA 2.1 Japan")
     print("  Cite: Mitsuhashi N et al., Nucleic Acids Res. 2009;37:D782-5")
