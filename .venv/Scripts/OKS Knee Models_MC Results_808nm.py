@@ -30,6 +30,7 @@ from pbm_mc_core import (
     optimize_source_positions_reciprocity,
     run_pmcx,
     analyze_fluence_absorption, analyze_penetration_depth, plot_depth_histogram,
+    target_depth_zone,
     plot_results, write_interactive_html,
     results_to_csv, melanin_comparison_to_csv,
     ensure_repo_current,
@@ -100,7 +101,7 @@ GROUPS = {
     'Synovial':  lambda n: 'synovial' in n,
     'Muscle':    lambda n: 'muscle'   in n,
     'Adipose':   lambda n: 'adipose'  in n,
-    'Skin':      lambda n: 'skin'     in n,
+    'Skin+Epidermis': lambda n: ('skin' in n) or ('epidermis' in n),
 }
 DOSE_GROUPS = {
     'Cartilage':      lambda n: 'cart'     in n,
@@ -289,8 +290,16 @@ def run_subject(subject_id, mesh_dir_base, output_dir, melanin_condition='fair')
             bin_centers, mean_flu, max_depth = analyze_penetration_depth(
                 fluence_combined, vol, VOXEL_SIZE, mesh_center, origin
             )
+            z_lo, z_hi, z_med = target_depth_zone(
+                vol, tissues, VOXEL_SIZE,
+                lambda n: ('cart' in n) or ('synovial' in n) or ('men' in n))
+            if z_lo is None:
+                z_lo, z_hi, z_med = 2.0, 3.5, 2.75
+            print(f"  Target depth zone: {z_lo:.2f}-{z_hi:.2f} cm (median {z_med:.2f} cm)")
             fig_depth = plot_depth_histogram(
                 bin_centers, mean_flu, subject_id, WAVELENGTH_NM,
+                depth_refs=[(z_med, 'Cartilage/meniscus/synovial (targets)')],
+                zone_lo=z_lo, zone_hi=z_hi,
                 cartilage_flu_mw=cart_flu_mw,
                 synovial_flu_mw=syn_flu_mw,
             )
