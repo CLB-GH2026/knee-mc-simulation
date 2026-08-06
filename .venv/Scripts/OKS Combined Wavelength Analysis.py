@@ -75,8 +75,9 @@ TARGET_GROUPS = ['Cartilage', 'Meniscus', 'Synovial']
 VOXEL_SIZE = 1.0
 
 
-def _latest(pattern):
-    dirs = sorted(BASE.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+def _latest(pattern, exclude=None):
+    dirs = [d for d in BASE.glob(pattern) if d.is_dir() and (exclude is None or exclude not in d.name)]
+    dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return dirs[0] if dirs else None
 
 
@@ -110,7 +111,9 @@ def combined_stats(f8, f6, vol, condition):
             'absorbed_650': float((mua6 * 10.0 * a6 * vox_cm3).sum()),
             'n_illuminated': n_ill,
             'coverage_pct': 100.0 * n_ill / n,
-            'illum_fluence': float(ac[illum].mean()) if n_ill else 0.0,
+            'illum_fluence': float(ac[illum].mean()) if n_ill else 0.0,   # combined, illum zone
+            'illum_808': float(a8[illum].mean()) if n_ill else 0.0,       # 808 contribution in illum zone
+            'illum_650': float(a6[illum].mean()) if n_ill else 0.0,       # 650 contribution in illum zone
         }
         out[name]['absorbed_comb'] = out[name]['absorbed_808'] + out[name]['absorbed_650']
     return out
@@ -133,6 +136,8 @@ def group_stats(ts):
             'absorbed_comb': sum(ts[k]['absorbed_comb'] for k in ks),
             'coverage_pct': wm('coverage_pct'),
             'illum_fluence': (sum(ts[k]['illum_fluence'] * ts[k]['n_illuminated'] for k in ks) / ivox) if ivox else 0.0,
+            'illum_808': (sum(ts[k]['illum_808'] * ts[k]['n_illuminated'] for k in ks) / ivox) if ivox else 0.0,
+            'illum_650': (sum(ts[k]['illum_650'] * ts[k]['n_illuminated'] for k in ks) / ivox) if ivox else 0.0,
         }
     return g
 
@@ -223,21 +228,23 @@ def write_comparison(all_data, out_path):
     def cart(subj, key):
         return all_data['fair'][subj].get('Cartilage', {}).get(key, 0.0)
     fig = go.Figure()
-    for wl, key, col in [('808 nm', 'mean_808', 'steelblue'),
-                         ('650 nm', 'mean_650', 'tomato'),
-                         ('Combined', 'mean_comb', 'seagreen')]:
+    # Illuminated-zone cartilage fluence (voxels where f_808+f_650 >= threshold);
+    # the 808/650 bars are each wavelength's contribution within that zone.
+    for wl, key, col in [('808 nm (illum.)', 'illum_808', 'steelblue'),
+                         ('650 nm (illum.)', 'illum_650', 'tomato'),
+                         ('Combined (illum.)', 'illum_fluence', 'seagreen')]:
         fig.add_trace(go.Bar(name=wl, x=subs, y=[cart(s, key) for s in subs], marker_color=col))
     fig.add_hline(y=FLUENCE_RATE_MIN_MW, line=dict(color='green', width=2, dash='dash'),
                   annotation_text='1 mW/cm² threshold', annotation_position='right')
-    fig.update_layout(title='Knee — Cartilage Mean Fluence by Subject & Wavelength (fair)',
-                      xaxis_title='Subject', yaxis_title='Mean Fluence Rate (mW/cm²)',
+    fig.update_layout(title='Knee — Cartilage Illuminated-zone Fluence by Subject & Wavelength (fair)',
+                      xaxis_title='Subject', yaxis_title='Illuminated-zone Fluence Rate (mW/cm²)',
                       barmode='group', template='plotly_white', height=500)
     fig.write_html(str(out_path))
     print(f"  Comparison: {out_path}")
 
 
 if __name__ == "__main__":
-    combined_dir = _latest("results_knee_combined_*")
+    combined_dir = _latest("results_knee_combined_*", exclude="analysis")
     if combined_dir is None:
         raise SystemExit("No results_knee_combined_* directory found — run the knee combined script first.")
     print(f"Reading combined run: {combined_dir}")
